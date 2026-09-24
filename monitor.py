@@ -1,5 +1,4 @@
 import os
-import time
 import requests
 from datetime import datetime
 from playwright.sync_api import sync_playwright
@@ -8,10 +7,31 @@ APPOINTMENT_URL = (
     "https://icp.administracionelectronica.gob.es/icpplus/index.html"
 )
 
-CHECK_EVERY_SECONDS = 60
-
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+PROVINCE = "Bizkaia"
+
+HUELLAS_TERMS = [
+    "TOMA DE HUELLAS",
+    "POLICIA - TOMA DE HUELLAS",
+    "EXPEDICIÓN DE TARJETA",
+    "TOMA DE HUELLAS (EXPEDICIÓN DE TARJETA)",
+]
+
+NO_APPOINTMENT_TERMS = [
+    "NO HAY CITAS",
+    "NO EXISTEN CITAS",
+    "NO HAY DISPONIBILIDAD",
+    "NO AVAILABLE APPOINTMENTS",
+]
+
+CAPTCHA_TERMS = [
+    "CAPTCHA",
+    "RECAPTCHA",
+    "VERIFICACIÓN",
+    "VERIFICATION",
+]
 
 
 def send_telegram(message):
@@ -19,11 +39,9 @@ def send_telegram(message):
         print("Telegram credentials are not configured.")
         return
 
-    url = (
-        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    )
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
-    requests.post(
+    response = requests.post(
         url,
         data={
             "chat_id": TELEGRAM_CHAT_ID,
@@ -32,12 +50,54 @@ def send_telegram(message):
         timeout=20,
     )
 
+    response.raise_for_status()
+
+
+def select_option_containing(page, terms):
+    selects = page.locator("select")
+
+    for i in range(selects.count()):
+        select = selects.nth(i)
+
+        try:
+            options = select.locator("option")
+            for j in range(options.count()):
+                text = options.nth(j).inner_text().strip().upper()
+
+                if any(term.upper() in text for term in terms):
+                    value = options.nth(j).get_attribute("value")
+
+                    if value:
+                        select.select_option(value=value)
+                    else:
+                        select.select_option(label=options.nth(j).inner_text())
+
+                    return True
+        except Exception:
+            continue
+
+    return False
+
+
+def click_aceptar(page):
+    buttons = page.get_by_role("button", name="Aceptar")
+
+    if buttons.count() > 0:
+        buttons.first.click()
+        return True
+
+    links = page.get_by_text("Aceptar", exact=True)
+
+    if links.count() > 0:
+        links.first.click()
+        return True
+
+    return False
+
 
 def check_appointment(page):
-    print(
-        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
-        "Checking appointment page..."
-    )
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\n[{now}] Checking Bilbao Toma de Huellas...")
 
     page.goto(
         APPOINTMENT_URL,
@@ -45,89 +105,118 @@ def check_appointment(page):
         timeout=60000,
     )
 
-    page.wait_for_timeout(5000)
+    page.wait_for_timeout(4000)
 
-    text = page.locator("body").inner_text().lower()
+    text = page.locator("body").inner_text().upper()
 
-    print(text[:2000])
+    # CAPTCHA / human verification
+    if any(term in text for term in CAPTCHA_TERMS):
+        print("CAPTCHA/human verification detected.")
+        return "captcha"
 
-    # Stop if the site presents a CAPTCHA or similar human verification.
-    captcha_words = [
-        "captcha",
-        "recaptcha",
-        "verificación",
-        "verification",
-    ]
+    print("Selecting Bizkaia...")
 
-    if any(word in text for word in captcha_words):
-        print("Human verification/CAPTCHA detected.")
+    if not select_option_containing(page, [PROVINCE]):
+        print("Could not find Bizkaia province selector.")
+        page.screenshot(path="debug_province.png", full_page=True)
+        return "unknown"
+
+    if not click_aceptar(page):
+        print("Could not click Aceptar after province.")
+        page.screenshot(path="debug_accept_province.png", full_page=True)
+        return "unknown"
+
+    page.wait_for_timeout(3000)
+
+    text = page.locator("body").inner_text().upper()
+
+    if any(term in text for term in CAPTCHA_TERMS):
+        print("CAPTCHA detected.")
+        return "captcha"
+
+    print("Looking for Toma de Huellas procedure...")
+
+    if not select_option_containing(page, HUELLAS_TERMS):
+        print("Could not find Toma de Huellas procedure.")
+        page.screenshot(path="debug_huellas.png", full_page=True)
+        print(text[:5000])
+        return "unknown"
+
+    if not click_aceptar(page):
+        print("Could not click Aceptar after selecting procedure.")
+        page.screenshot(path="debug_accept_huellas.png", full_page=True)
+        return "unknown"
+
+    page.wait_for_timeout(3000)
+
+    text = page.locator("body").inner_text().upper()
+
+    if any(term in text for term in CAPTCHA_TERMS):
+        print("CAPTCHA detected.")
+        return "captcha"
+
+    print(text[:5000])
+
+    # Explicit no-appointment response
+    if any(term in text for term in NO_APPOINTMENT_TERMS):
+        print("❌ No appointment available.")
         return False
 
-    # These are indicators that the appointment process may have
-    # available options. The script does NOT book an appointment.
-    availability_words = [
-        "cita disponible",
-        "citas disponibles",
-        "disponibilidad",
-        "seleccione una cita",
-        "appointment available",
+    # Indicators that the appointment calendar/selection is available
+    availability_indicators = [
+        "SELECCIONE UNA CITA",
+        "SELECCIONE LA CITA",
+        "SELECCIONE FECHA",
+        "SELECCIONE HORA",
+        "FECHA",
+        "HORA",
+        "CITA DISPONIBLE",
+        "CITAS DISPONIBLES",
     ]
 
-    available = any(word in text for word in availability_words)
-
-    if available:
+    if any(term in text for term in availability_indicators):
+        print("🚨 POSSIBLE APPOINTMENT AVAILABILITY DETECTED!")
+        page.screenshot(path="appointment_available.png", full_page=True)
         return True
 
-    # Common no-availability wording.
-    no_availability_words = [
-        "no hay citas",
-        "no existen citas",
-        "no hay disponibilidad",
-        "no available appointments",
-        "no appointments available",
-    ]
-
-    if any(word in text for word in no_availability_words):
-        return False
-
-    print("Could not determine availability from page text.")
-    return False
+    print("⚠️ Could not determine availability.")
+    page.screenshot(path="debug_final.png", full_page=True)
+    return "unknown"
 
 
 def main():
-    already_alerted = False
-
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
 
-        page = browser.new_page()
+        page = browser.new_page(
+            viewport={"width": 1440, "height": 1000}
+        )
 
-        while True:
-            try:
-                available = check_appointment(page)
+        try:
+            result = check_appointment(page)
 
-                if available and not already_alerted:
-                    message = (
-                        "🚨 BILBAO HUELLAS ALERT 🚨\n\n"
-                        "The appointment page may show availability.\n"
-                        "Open the official appointment website and "
-                        "check/book manually."
-                    )
+            if result is True:
+                message = (
+                    "🚨 BILBAO HUELLAS ALERT 🚨\n\n"
+                    "Possible Toma de Huellas appointment availability "
+                    "was detected.\n\n"
+                    "Open the official appointment website and check "
+                    "manually immediately."
+                )
 
-                    send_telegram(message)
-                    already_alerted = True
+                send_telegram(message)
 
-                elif not available:
-                    already_alerted = False
+            elif result == "captcha":
+                print("CAPTCHA encountered. No alert sent.")
 
-            except Exception as e:
-                print(f"Error: {e}")
+            elif result == "unknown":
+                print("Availability could not be confirmed.")
 
-            print(
-                f"Waiting {CHECK_EVERY_SECONDS} seconds before next check..."
-            )
+        except Exception as e:
+            print(f"ERROR: {e}")
 
-            time.sleep(CHECK_EVERY_SECONDS)
+        finally:
+            browser.close()
 
 
 if __name__ == "__main__":
